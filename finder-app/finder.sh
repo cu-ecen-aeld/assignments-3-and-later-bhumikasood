@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Bhumika Sood
 # Find string in files of specified directory.
 
