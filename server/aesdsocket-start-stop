@@ -1,0 +1,16 @@
+# Bhumika Sood
+# Start-up script to start aesdsocket project
+
+case "$1" in
+    start)
+        echo "Starting aesdsocket"
+        start-stop-daemon -S -n simpleserver -a /usr/bin/aesdsocket -- -d
+        ;;
+    stop)
+        echo "Stopping aesdsocket"
+        start-stop-daemon -K -n aesdsock --signal SIGTERM
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+    exit1
+esac
