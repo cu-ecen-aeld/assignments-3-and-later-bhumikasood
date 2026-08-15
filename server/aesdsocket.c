@@ -5,52 +5,87 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h> 
 #include <string.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PORT    "9000"
 #define BACKLOG 10
-#define OUTFILE "/var/tmp/aesdsocketdata.txt"
+#define OUTFILE "/var/tmp/aesdsocketdata"
+#define BUFFER_SIZE 1024
 
-// Declare socket and client file descriptors
-int sockfd, clientfd = -1;
+// Node structure for connection thread
+typedef struct ThreadNode {
+    pthread_t thread;
+    int clientfd;
+    char clientIP[16];
+    int complete;
+    SLIST_ENTRY(ThreadNode) entries;
+} ThreadNode;
+
+// Define head of linked list
+SLIST_HEAD(ThreadHead, ThreadNode) connectionList;
+
+// Declare socket file descriptors
+int sockfd = -1;
 
 // Declare file pointer
 FILE *outfile;
 
+// Mutex for outfile access
+pthread_mutex_t outfileMutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Signal flag
+static volatile sig_atomic_t caughtSignal = 0;
+
 // Handle SIGINT or SIGTERM signals
 static void signalHandler(int signalNumber)
 {   
-    syslog(LOG_DEBUG, "Caught signal, exiting");
-
-    // Close client socket
-    if (clientfd != -1)
-    {
-        shutdown(clientfd, SHUT_RDWR);
-        close(clientfd);
-    }
+    // Set signal flag high
+    syslog(LOG_INFO, "Caught signal");
+    caughtSignal = 1;
 
     // Close server socket
     if (sockfd != -1)
     {
+        syslog(LOG_DEBUG, "Shutting down socket");
         shutdown(sockfd, SHUT_RDWR);
         close(sockfd);
+        sockfd = -1;
     }
+}
 
-    // Close outfile and delete from filesystem
-    if (outfile != NULL)
+static void exitRoutine()
+{
+    syslog(LOG_DEBUG, "Exiting safely!");
+
+    // Parse linked list
+    ThreadNode *currentNode;
+    while (!SLIST_EMPTY(&connectionList))
     {
-        fclose(outfile);
-    }
-    unlink(OUTFILE);
+        currentNode = SLIST_FIRST(&connectionList);
+        SLIST_REMOVE_HEAD(&connectionList, entries);
 
-    exit(0);
+        if (currentNode->clientfd != -1)
+        {
+            shutdown(currentNode->clientfd, SHUT_RDWR);
+            close(currentNode->clientfd);
+        }
+
+        pthread_join(currentNode->thread, NULL);
+        free(currentNode);
+    }
+
+    pthread_mutex_destroy(&outfileMutex);
+    remove(OUTFILE); 
 }
 
 // Create daemon if command line argument is specified
@@ -90,6 +125,115 @@ int createDaemon()
     dup(0);
 
     return 0;
+}
+
+// Write timestamp to outfile every 10 seconds
+void *timerTask(void *arg)
+{
+    while (!caughtSignal)
+    {
+        // Sleep for 10 seconds
+        for (int i = 0; i < 10 && !caughtSignal; i++)
+        {
+            sleep(1);
+        }
+
+        // Get system time
+        time_t currentTime = time(NULL);
+        struct tm *timeInfo = localtime(&currentTime);
+        
+        // Format system time
+        char timeValue[128]; 
+        strftime(timeValue, sizeof(timeValue), "%a, %d %b %Y %H:%M:%S %z", timeInfo);
+
+        // Grab file mutex and write time to file
+        pthread_mutex_lock(&outfileMutex);
+        FILE *outfile = fopen(OUTFILE, "a");
+
+        if (outfile != NULL)
+        {
+            fprintf(outfile, "timestamp:%s\n", timeValue);
+            fclose(outfile);
+        }
+        
+        // Release mutex
+        pthread_mutex_unlock(&outfileMutex);
+    }
+
+    return NULL;
+}
+
+// Handle incoming client connections and write packets to file
+void *clientTask(void *arg)
+{
+    // Read node from linked list
+    ThreadNode *node = (ThreadNode*) arg;
+
+    // Read incoming data from server and write to file
+    size_t bufferSize = BUFFER_SIZE;
+    size_t bytesRead, packetLength = 0;
+    char *buffer = malloc(bufferSize);
+
+    while (!caughtSignal && (bytesRead = recv(node->clientfd, buffer + packetLength, BUFFER_SIZE, 0)) > 0)
+    {
+        // Increment packet length by actual number of bytes read
+        packetLength += bytesRead;
+
+        // Process packet to file upon receipt of new line character
+        if (packetLength > 0 && buffer[packetLength - 1] == '\n')
+        {
+            // Grab file mutex and open outfile
+            pthread_mutex_lock(&outfileMutex);
+            FILE *outfile = fopen(OUTFILE, "a+");
+
+            if (outfile != NULL)
+            {
+                // Write packet to outfile
+                fwrite(buffer, sizeof(char), packetLength, outfile);
+
+                // Move file pointer to beginning of outfile
+                fseek(outfile, 0, SEEK_SET);
+
+                // Read from file to write buffer and second to client
+                char writeBuffer[BUFFER_SIZE];
+                size_t bytesToSend = 0;
+                while ((bytesToSend = fread(writeBuffer, sizeof(char), BUFFER_SIZE, outfile)) > 0)
+                {
+                    send(node->clientfd, writeBuffer, bytesToSend, 0);
+                }
+                
+                // Close outfile
+                fclose(outfile);
+            }
+            // Release mutex
+            pthread_mutex_unlock(&outfileMutex);
+
+            // 3. Clear our tracking parameters completely to start fresh for the next line
+            packetLength = 0;
+            bufferSize = BUFFER_SIZE;
+            char *resetBuffer = realloc(buffer, bufferSize);
+            buffer = resetBuffer;
+            memset(buffer, 0, bufferSize);
+        }
+        else
+        {
+            // Realloc buffer if end of packet not received
+            bufferSize += BUFFER_SIZE;
+            char *tempBuffer = realloc(buffer, bufferSize);
+            buffer = tempBuffer;
+        }
+
+    }
+
+    // Close connection with client
+    close(node->clientfd);
+    syslog(LOG_INFO, "Closed connection from %s", node->clientIP);
+    node->complete = 1;
+
+    // Free allocated memory
+    free(buffer);
+
+    return NULL;
 }
 
 int main(int argc, char* argv[])
@@ -158,75 +302,91 @@ int main(int argc, char* argv[])
     {
         perror("Failed to listen for connections on socket");
         close(sockfd);
-        freeaddrinfo(server);
         return -1;
     }
 
-    // Open output file 
-    outfile = fopen(OUTFILE, "a+");
-    if (outfile == NULL)
+    // Initialize the linked list
+    SLIST_INIT(&connectionList);
+
+    // Start timer task
+    pthread_t timerThread;
+    if (pthread_create(&timerThread, NULL, timerTask, NULL) != 0)
     {
-        perror("Failed to open output file");
+        perror("Failed to create timer task");
         close(sockfd);
         return -1;
     }
 
     // Continuously accept connections until signal is received
-    while (1)
+    while (!caughtSignal)
     {
         // Accept incoming connection
         struct sockaddr_storage client;
         socklen_t addrLength = sizeof(client);
-        clientfd = accept(sockfd, (struct sockaddr*)&client, &addrLength);
+        int incomingClient = accept(sockfd, (struct sockaddr*)&client, &addrLength);
         // Store IP address of incoming connection
-        char clientIP[16];
+        char incomingClientIP[16];
         struct sockaddr_in *clientAddr = (struct sockaddr_in *)&client;
-        inet_ntop(AF_INET, &clientAddr->sin_addr, clientIP, sizeof(clientIP));
-        if (clientfd == -1)
+        inet_ntop(AF_INET, &clientAddr->sin_addr, incomingClientIP, sizeof(incomingClientIP));
+        if (incomingClient == -1)
         {
+            if (caughtSignal)
+            {
+                break;
+            }
             perror("Failed to accept connection");
             continue;
         }
         else
         {
-            syslog(LOG_INFO, "Accepted connection from %s", clientIP);
+            syslog(LOG_INFO, "Accepted connection from %s", incomingClientIP);
         }
 
-        // Read incoming data from server and write to file
-        size_t bufferSize = 1024;
-        size_t bytesRead = 0;
-        char buffer[bufferSize];
-        memset(&buffer, 0, bufferSize);
+        // Create node for new connection
+        ThreadNode *newNode = malloc(sizeof(ThreadNode));
+        newNode->clientfd = incomingClient;
+        strcpy(newNode->clientIP, incomingClientIP);
+        newNode->complete = 0;
 
-        while ((bytesRead = recv(clientfd, buffer, bufferSize, 0)) > 0)
+        // Start thread for new node
+        if (pthread_create(&newNode->thread, NULL, clientTask, newNode) != 0)
         {
-            // Write 1024 bytes read from input buffer to file
-            fwrite(buffer, sizeof(char), bytesRead, outfile);
+            perror("Failed to create client task");
+            close(incomingClient);
+            free(newNode);
+            continue;
+        }
 
-            // Send outfile over connection when last packet is received
-            if (bytesRead < bufferSize)
+        // Add node to linked list
+        SLIST_INSERT_HEAD(&connectionList, newNode, entries);
+
+        // Manage linked list
+        ThreadNode *currentNode;
+        ThreadNode *completeNode = NULL;
+
+        SLIST_FOREACH(currentNode, &connectionList, entries)
+        {
+            // Check if current node is complete
+            if (currentNode->complete)
             {
-                // Move file pointer to beginning of outfile
-                fseek(outfile, 0, SEEK_SET);
-
-                // Clear buffer
-                memset(buffer, 0, bufferSize);
-
-                // Send outfile to client
-                while ((bytesRead = fread(buffer, sizeof(char), bufferSize, outfile)) != 0)
-                {
-                    send(clientfd, buffer, bytesRead, 0);
-                }
+                completeNode = currentNode;
+                break;
             }
         }
-        // Close connection with client
-        close(clientfd);
-        syslog(LOG_INFO, "Closed connection from %s", clientIP);
+
+        // Remove completed node from list and join thread
+        if (completeNode != NULL)
+        {
+            SLIST_REMOVE(&connectionList, completeNode, ThreadNode, entries);
+            pthread_join(completeNode->thread, NULL);
+            free(completeNode);
+        }
     }
 
-    // Close sockets
-    close(sockfd);
-
-    // Close outfile
-    fclose(outfile);
+    // Join timer task
+    pthread_join(timerThread, NULL);
+    unlink(OUTFILE);
+    // Run exit routine
+    exitRoutine();
+    return 0;
 }
