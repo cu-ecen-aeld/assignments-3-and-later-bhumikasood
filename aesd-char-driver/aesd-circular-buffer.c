@@ -29,9 +29,34 @@
 struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct aesd_circular_buffer *buffer,
             size_t char_offset, size_t *entry_offset_byte_rtn )
 {
-    /**
-    * TODO: implement per description
-    */
+    // Track index of buffer structure
+    uint8_t bufferStructureIndex = buffer->out_offs;
+
+    while (true)
+    {
+        // Read size of buffer entry at output pointer
+        size_t currentSize = buffer->entry[bufferStructureIndex].size;
+        // Check if size is greater than char offset
+        if (currentSize <= char_offset)
+        {
+            // Decrement char offset by size of element
+            char_offset -= currentSize;
+
+            // Increment output pointer
+            bufferStructureIndex = (bufferStructureIndex + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+
+            // Check if output pointer is valid
+            if (bufferStructureIndex == buffer->in_offs)
+            {
+                break;
+            }
+        }
+        else 
+        {
+            *entry_offset_byte_rtn = char_offset;
+            return &(buffer->entry[bufferStructureIndex]);
+        }
+    }
     return NULL;
 }
 
@@ -44,9 +69,24 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
 */
 void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry)
 {
-    /**
-    * TODO: implement per description
-    */
+    // Check if buffer is full
+    if (buffer->full)
+    {
+        // Advance the output pointer or rollover to 0
+        buffer->out_offs = (buffer->out_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    }
+
+    // Add entry at input pointer
+    buffer->entry[buffer->in_offs] = *add_entry;
+
+    // Increment input pointer or rollover to 0
+    buffer->in_offs = (buffer->in_offs + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+
+    // Set the full flag if the input and output pointer are at the same location
+    if (buffer->in_offs == buffer->out_offs)
+    {
+        buffer->full = true;
+    }
 }
 
 /**
