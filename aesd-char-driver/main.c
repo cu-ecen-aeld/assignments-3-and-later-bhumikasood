@@ -107,6 +107,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
 {
     struct aesd_dev *dev = filp->private_data;
     char *newline = NULL;
+    char *writeBuffer = NULL;
     ssize_t retval = -ENOMEM;
 
     // Lock with mutexx
@@ -117,11 +118,12 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
     }
 
     // Allocate size of entry buffer with count of new data to be appended
-    dev->writeEntry.buffptr = krealloc(dev->writeEntry.buffptr, dev->writeEntry.size + count, GFP_KERNEL);
-    if (dev->writeEntry.buffptr == NULL)
+    writeBuffer = krealloc(dev->writeEntry.buffptr, dev->writeEntry.size + count, GFP_KERNEL);
+    if (writeBuffer == NULL)
     {
         goto exit;
     }
+    dev->writeEntry.buffptr = writeBuffer;
 
     // Copy from user space buffer
     if (copy_from_user((char *)(dev->writeEntry.buffptr + dev->writeEntry.size), buf, count))
@@ -139,6 +141,12 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
     newline = memchr(dev->writeEntry.buffptr, '\n', dev->writeEntry.size);
     if (newline != NULL)
     {
+        // Free the oldest entry's buffer before it gets overwritten
+        if (dev->buffer.full)
+        {
+            kfree(dev->buffer.entry[dev->buffer.in_offs].buffptr);
+        }
+
         // Add completed entry to circular buffer
         aesd_circular_buffer_add_entry(&dev->buffer, &dev->writeEntry);
         

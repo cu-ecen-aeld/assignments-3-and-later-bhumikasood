@@ -94,7 +94,9 @@ static void exitRoutine()
     }
 
     pthread_mutex_destroy(&outfileMutex);
+#if !USE_AESD_CHAR_DEVICE
     remove(OUTFILE); 
+#endif
 }
 
 // Create daemon if command line argument is specified
@@ -154,15 +156,17 @@ void *timerTask(void *arg)
         // Format system time
         char timeValue[128]; 
         strftime(timeValue, sizeof(timeValue), "%a, %d %b %Y %H:%M:%S %z", timeInfo);
+        char timestamp[256];
+        int len = snprintf(timestamp, sizeof(timestamp), "timestamp:%s\n", timeValue);
 
         // Grab file mutex and write time to file
         pthread_mutex_lock(&outfileMutex);
-        FILE *outfile = fopen(OUTFILE, "a");
+        int outfile = open(OUTFILE, O_WRONLY | O_APPEND | O_CREAT, 0666);
 
-        if (outfile != NULL)
+        if (outfile >= 0)
         {
-            fprintf(outfile, "timestamp:%s\n", timeValue);
-            fclose(outfile);
+            write(outfile, timestamp, len);
+            close(outfile);
         }
         
         // Release mutex
@@ -193,27 +197,30 @@ void *clientTask(void *arg)
         {
             // Grab file mutex and open outfile
             pthread_mutex_lock(&outfileMutex);
-            FILE *outfile = fopen(OUTFILE, "a+");
-
-            if (outfile != NULL)
+            int outfile = open(OUTFILE, O_WRONLY | O_APPEND | O_CREAT, 0666);
+            if (outfile >= 0)
             {
                 // Write packet to outfile
-                fwrite(buffer, sizeof(char), packetLength, outfile);
+                write(outfile, buffer, packetLength);
+                close(outfile);
+            }
 
-                // Move file pointer to beginning of outfile
-                fseek(outfile, 0, SEEK_SET);
-
+            // Open file to read
+            int readfile = open(OUTFILE, O_RDONLY);
+            if (readfile >= 0)
+            {
                 // Read from file to write buffer and second to client
                 char writeBuffer[BUFFER_SIZE];
-                size_t bytesToSend = 0;
-                while ((bytesToSend = fread(writeBuffer, sizeof(char), BUFFER_SIZE, outfile)) > 0)
+                ssize_t bytesToSend = 0;
+                while ((bytesToSend = read(readfile, writeBuffer, BUFFER_SIZE)) > 0)
                 {
                     send(node->clientfd, writeBuffer, bytesToSend, 0);
                 }
-                
-                // Close outfile
-                fclose(outfile);
+
+                // Close readfile
+                close(readfile);
             }
+
             // Release mutex
             pthread_mutex_unlock(&outfileMutex);
 
