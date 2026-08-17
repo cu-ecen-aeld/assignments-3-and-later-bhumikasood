@@ -4,6 +4,15 @@ OBJS := $(SRC:.c=.o)
 CC ?= $(CROSS_COMPILE)gcc
 CFLAGS := -g -Wall -Werror
 
+USE_AESD_CHAR_DEVICE ?= 1
+ifeq ($(USE_AESD_CHAR_DEVICE), 1)
+    CFLAGS += -DUSE_AESD_CHAR_DEVICE=1
+else
+    CFLAGS += -DUSE_AESD_CHAR_DEVICE=0
+endif
+
+LDFLAGS += -pthread
+
 all: $(TARGET)
 default: $(TARGET)
 

@@ -17,9 +17,18 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef USE_AESD_CHAR_DEVICE
+#define USE_AESD_CHAR_DEVICE 1
+#endif
+
+#if USE_AESD_CHAR_DEVICE
+#define OUTFILE "/dev/aesdchar"
+#else
+#define OUTFILE "/var/tmp/aesdsocketdata"
+#endif
+
 #define PORT    "9000"
 #define BACKLOG 10
-#define OUTFILE "/var/tmp/aesdsocketdata"
 #define BUFFER_SIZE 1024
 
 // Node structure for connection thread
@@ -308,6 +317,7 @@ int main(int argc, char* argv[])
     // Initialize the linked list
     SLIST_INIT(&connectionList);
 
+#if !USE_AESD_CHAR_DEVICE
     // Start timer task
     pthread_t timerThread;
     if (pthread_create(&timerThread, NULL, timerTask, NULL) != 0)
@@ -316,7 +326,7 @@ int main(int argc, char* argv[])
         close(sockfd);
         return -1;
     }
-
+#endif
     // Continuously accept connections until signal is received
     while (!caughtSignal)
     {
@@ -383,9 +393,11 @@ int main(int argc, char* argv[])
         }
     }
 
-    // Join timer task
+#if !USE_AESD_CHAR_DEVICE
     pthread_join(timerThread, NULL);
     unlink(OUTFILE);
+#endif
+
     // Run exit routine
     exitRoutine();
     return 0;
