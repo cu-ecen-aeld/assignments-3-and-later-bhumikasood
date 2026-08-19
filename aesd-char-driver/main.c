@@ -18,6 +18,7 @@
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 
 // Function prototypes
 int aesd_open(struct inode *inode, struct file *filp);
@@ -25,6 +26,8 @@ int aesd_release(struct inode *inode, struct file *filp);
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
 static int aesd_setup_cdev(struct aesd_dev *dev);
+loff_t aesd_llseek(struct file *filp, loff_t off, int whence);
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg);
 int aesd_init_module(void);
 void aesd_cleanup_module(void);
 
@@ -86,8 +89,8 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
     }
     PDEBUG("Read %zu bytes with offset %lld", count, *f_pos);
 
-    // Copy data to user space buffer   
-    if (copy_to_user(buf, entry->buffptr, count) != 0)
+    // Copy data to user space buffer
+    if (copy_to_user(buf, entry->buffptr + offset, count) != 0)
     {
         retval = -EFAULT;
         goto exit;
@@ -162,11 +165,13 @@ exit:
 }
 
 struct file_operations aesd_fops = {
-    .owner =    THIS_MODULE,
-    .read =     aesd_read,
-    .write =    aesd_write,
-    .open =     aesd_open,
-    .release =  aesd_release,
+    .owner =          THIS_MODULE,
+    .read =           aesd_read,
+    .write =          aesd_write,
+    .open =           aesd_open,
+    .release =        aesd_release,
+    .llseek =         aesd_llseek,
+    .unlocked_ioctl = aesd_ioctl,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
@@ -235,6 +240,119 @@ void aesd_cleanup_module(void)
         }
     }
     unregister_chrdev_region(devno, 1);
+}
+
+loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
+{
+    struct aesd_dev *dev = filp->private_data;
+    loff_t newPosition;
+
+    switch (whence)
+    {
+        // Seek set
+        case 0:
+            newPosition = off;
+            break;
+        // Seek current
+        case 1:
+            newPosition = filp->f_pos + off;
+            break;
+        // Seek end
+        case 2:
+        { 
+            // Calculate total size of circular buffer
+            struct aesd_buffer_entry *entry;
+            uint8_t index;
+            loff_t totalSize = 0;
+            AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->buffer, index)
+            {
+                totalSize += entry->size;
+            }
+
+            newPosition = totalSize + off;
+            break;
+        }
+        default:
+            return -EINVAL;
+    }
+
+    if (newPosition < 0)
+    {
+        return -EINVAL;
+    }
+
+    PDEBUG("Current file position %lld updated to new file position %lld", filp->f_pos, newPosition);
+    filp->f_pos = newPosition;
+
+    return filp->f_pos;
+}
+
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    int retval = 0;
+    struct aesd_seekto seek;
+    struct aesd_dev *dev = filp->private_data;
+
+    switch (cmd)
+    {
+        case AESDCHAR_IOCSEEKTO:
+        {
+            // Lock with mutexx
+            if (mutex_lock_interruptible(&dev->lock))
+            {
+                PDEBUG("Could not acquire mutex");
+                return -ERESTARTSYS;
+            }
+
+            // Copy from user space buffer
+            if (copy_from_user(&seek, (struct aesd_seekto __user*) arg, sizeof(seek)))
+            {
+                retval = -EFAULT;
+                goto exit;   
+            }
+            
+            // Check the number of entries in the buffer
+            int commandCount = 0;
+            if (dev->buffer.full)
+            {
+                commandCount = AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+            }
+            else
+            {
+                commandCount = (dev->buffer.in_offs - dev->buffer.out_offs + AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED)
+                                % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+            }
+
+            // Return error for write command out of range
+            if (seek.write_cmd >= commandCount)
+            {
+                retval = -EINVAL;
+                goto exit;
+            }
+
+            // Find starting offset
+            loff_t newPosition = 0;
+            for (int i = 0; i < seek.write_cmd; i++)
+            {
+                uint8_t index = (dev->buffer.out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+                newPosition += dev->buffer.entry[index].size;
+            }
+            // Calculate new position
+            newPosition += seek.write_cmd_offset;
+
+            // Store result
+            filp->f_pos = newPosition;
+            retval = 0;
+            break;
+        }
+        default:
+            return -ENOTTY;
+    }
+
+exit:
+    // Release mutex    
+    mutex_unlock(&dev->lock);
+    return retval;
 }
 
 module_init(aesd_init_module);

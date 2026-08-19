@@ -17,6 +17,9 @@
 #include <time.h>
 #include <unistd.h>
 
+// From aesd char driver
+#include "../aesd-char-driver/aesd_ioctl.h"
+
 #ifndef USE_AESD_CHAR_DEVICE
 #define USE_AESD_CHAR_DEVICE 1
 #endif
@@ -195,36 +198,72 @@ void *clientTask(void *arg)
         // Process packet to file upon receipt of new line character
         if (packetLength > 0 && buffer[packetLength - 1] == '\n')
         {
-            // Grab file mutex and open outfile
+            // Check if packet is IOCTL command
+            int seekCommand, seekOffset = 0;
+            int ioctlCommand = (sscanf(buffer, "AESDCHAR_IOCSEEKTO:%u,%u", &seekCommand, &seekOffset) == 2);
+
+            // Grab file mutex
             pthread_mutex_lock(&outfileMutex);
-            int outfile = open(OUTFILE, O_WRONLY | O_APPEND | O_CREAT, 0666);
-            if (outfile >= 0)
+
+            if (ioctlCommand)
             {
-                // Write packet to outfile
-                write(outfile, buffer, packetLength);
+                // Open file in read/write mode
+                int outfile = open(OUTFILE, O_RDWR);
+                if (outfile >= 0)
+                {
+                    // Write command parameters to struct
+                    struct aesd_seekto seek;
+                    seek.write_cmd = seekCommand;
+                    seek.write_cmd_offset = seekOffset;
+
+                    // Send IOCTL command to driver
+                    if (ioctl(outfile, AESDCHAR_IOCSEEKTO, &seek) == 0)
+                    {
+                        // Read from file to write buffer and send to client
+                        char writeBuffer[BUFFER_SIZE];
+                        ssize_t bytesToSend = 0;
+                        while ((bytesToSend = read(outfile, writeBuffer, BUFFER_SIZE)) > 0)
+                        {
+                            send(node->clientfd, writeBuffer, bytesToSend, 0);
+                        }
+                    }
+                }
+                else
+                {
+                    syslog(LOG_ERR, "AESDCHAR_IOCSEEKTO failed!");
+                }
                 close(outfile);
             }
-
-            // Open file to read
-            int readfile = open(OUTFILE, O_RDONLY);
-            if (readfile >= 0)
+            else
             {
-                // Read from file to write buffer and second to client
-                char writeBuffer[BUFFER_SIZE];
-                ssize_t bytesToSend = 0;
-                while ((bytesToSend = read(readfile, writeBuffer, BUFFER_SIZE)) > 0)
+                int outfile = open(OUTFILE, O_WRONLY | O_APPEND | O_CREAT, 0666);
+                if (outfile >= 0)
                 {
-                    send(node->clientfd, writeBuffer, bytesToSend, 0);
+                    // Write packet to outfile
+                    write(outfile, buffer, packetLength);
+                    close(outfile);
                 }
 
-                // Close readfile
-                close(readfile);
-            }
+                // Open file to read
+                int readfile = open(OUTFILE, O_RDONLY);
+                if (readfile >= 0)
+                {
+                    // Read from file to write buffer and send to client
+                    char writeBuffer[BUFFER_SIZE];
+                    ssize_t bytesToSend = 0;
+                    while ((bytesToSend = read(readfile, writeBuffer, BUFFER_SIZE)) > 0)
+                    {
+                        send(node->clientfd, writeBuffer, bytesToSend, 0);
+                    }
 
+                    // Close readfile
+                    close(readfile);
+                }
+            }
             // Release mutex
             pthread_mutex_unlock(&outfileMutex);
 
-            // 3. Clear our tracking parameters completely to start fresh for the next line
+            // Clear our tracking parameters completely to start fresh for the next line
             packetLength = 0;
             bufferSize = BUFFER_SIZE;
             char *resetBuffer = realloc(buffer, bufferSize);
